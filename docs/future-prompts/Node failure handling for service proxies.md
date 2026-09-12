@@ -503,10 +503,18 @@ known defect.
   `putIfAbsent` and removes inline, and the in-flight count is a pair of plain methods. The argument
   tokenizer is a synchronous call with no `block()` on the event loop.
 
-Not fixed: `cancelRequest` sends the cancel to the request address, which on an unscoped
-multi-instance service may not be the producing instance. Routing it through `__origin-cri` would not
-help, because the Java supervisor sets that header to the request address it received, the same
-shared address. A node-scoped cancel needs the producing node's identity on the stream's replies.
+The second review's remaining findings (`Node failure review round two.md`) are fixed on the same
+branch: a cancel is published to every instance of the service, so the one producing the stream gets
+it whichever instance round-robin gave the request; a reply the gateway connection does not owe is
+dropped instead of ending the connection, and a TS service drops results for invocations of a lost
+connection; `VertxFutureRpcReturnValueHandler` completes idempotently; lease keys are qualified per
+connection; a CONNECTION keep-alive touches the session at connect and every quarter of the timeout;
+a control event earns no reply grant; a reused subscription id ends its predecessor; a requester whose
+listener is gone is answered as well as cancelled; VmNode status and allocation are partial updates so
+only a heartbeat writes `lastSeen`, and the reaper takes STOPPING workloads with the rest; the TS
+supervisor stops a synchronous stream on its first unsendable value, answers with the
+`{exceptionName, exceptionClass, errorMessage}` shape every runtime reads, and the vm-manager bounds
+its graceful disconnect on shutdown.
 
 ## Numbering
 

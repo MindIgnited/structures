@@ -1,9 +1,10 @@
-Second adversarial review of the node-failure series, run after the first round's fixes landed as
-PR #558. Every item below was traced in the code before it was written down; none is fixed yet.
+Second adversarial review of the node-failure series, run after the first round's fixes landed on
+PR #558. Every item below was traced in the code before it was written down, and every one is now
+resolved on that same PR: 1 through 9 as written (4 fell out of the supervisor pass), 10 by
+publishing cancels instead of routing them, 11 by dispatching invocations on the delivery context.
 The TS connection manager and event bus were taken out of this list and reworked directly, so
-nothing here concerns `StompConnectionManager.ts` or `EventBus.ts`. Work the list top down; each
-item names the file, the code, the sequence that misbehaves, and the fix. Add the test each one
-names, or say why the harness cannot express it.
+nothing here concerns `StompConnectionManager.ts` or `EventBus.ts`. The items stay as the record of
+what was found and why each fix has the shape it has.
 
 ## 1. A refused reply kills the client's connection
 
@@ -75,7 +76,7 @@ services.requestLivenessWatcher.watch(leasePrefix + correlationId, nodeId, () ->
 services.requestLivenessWatcher.settle(leasePrefix + correlationId);     // settle() and dispose()
 ```
 
-## 4. `SingleValueSubscriber.onComplete` is the unguarded twin of the `onNext` fix
+## 4. `SingleValueSubscriber.onComplete` is the unguarded twin of the `onNext` fix (fixed by the supervisor pass)
 
 ```java
 if(!valueReceived){
@@ -142,7 +143,16 @@ the status, and close the `Vertx` instance in `@AfterEach`. Add: marking UNREACH
 - vm-manager `shutdown()` awaits a graceful `disconnect()` that on a half-open socket waits for the
   heartbeat timeout plus the WebSocket close timeout. Bound it and exit.
 
-## 10. Design-level: the unscoped-service cancel miss
+## 10. Decided: a cancel is published to every instance
+
+The per-instance control address below was the first design; the ack already names the node, but
+Vert.x has no way to send to one node on a shared address and its node selector sees only the
+address, so a node-scoped cancel needs a new address per service per node. A cancel names a UUID
+correlation id, and an instance that does not hold it already ignores it, so the cancel is
+published instead: every instance receives it, the producer acts, nothing else changes on the
+wire. `RpcLivenessTests.testCancelReachesTheInstanceProducingTheStream` pins it.
+
+The original finding, kept for the record:
 
 `DefaultRpcServiceProxyHandle.cancelRequest` sends the cancel to the request address; with two remote
 instances of an unscoped service and no interleaved traffic, round-robin lands it on the wrong one
