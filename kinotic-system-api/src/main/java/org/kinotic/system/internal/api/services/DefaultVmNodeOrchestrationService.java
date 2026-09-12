@@ -245,16 +245,17 @@ public class DefaultVmNodeOrchestrationService implements VmNodeOrchestrationSer
             ret = Future.succeededFuture();
         } else {
             log.warn("VmNode {} ({}) is unreachable and holds no vm-manager registration, taking no workloads", node.getName(), nodeId);
-            node.setStatus(new VmNodeStatus(VmNodeStatusType.UNREACHABLE, node.getStatus().getHealthMessage()));
-            // findAvailableNode selects on status.type with a search, so the change has to be indexed first
-            ret = vmNodeService.saveSync(node).mapEmpty();
+            // Only the status is written, so a heartbeat that landed after the read keeps its lastSeen.
+            // findAvailableNode selects on status.type with a search, so the change has to be indexed first.
+            ret = vmNodeService.updateStatusSync(nodeId,
+                                                 new VmNodeStatus(VmNodeStatusType.UNREACHABLE, node.getStatus().getHealthMessage()));
         }
         return ret;
     }
 
     /**
      * Periodically marks every node that has not sent a heartbeat within the timeout OFFLINE, whatever it
-     * reported last, and marks the workloads running on it FAILED.
+     * reported last, and marks every workload still on it FAILED.
      */
     private void checkNodeHealth() {
         try {
@@ -273,9 +274,11 @@ public class DefaultVmNodeOrchestrationService implements VmNodeOrchestrationSer
                                 log.warn("VmNode {} ({}) missed heartbeat, marking OFFLINE",
                                          node.getName(), node.getId());
 
-                                node.setStatus(new VmNodeStatus(VmNodeStatusType.OFFLINE, node.getStatus().getHealthMessage()));
-                                vmNodeService.saveSync(node)
-                                        .compose(offlineNode -> markNodeWorkloadsFailed(offlineNode.getId()))
+                                // Only the status is written, so a heartbeat that landed after findAll read
+                                // the node keeps its lastSeen
+                                vmNodeService.updateStatusSync(node.getId(),
+                                                               new VmNodeStatus(VmNodeStatusType.OFFLINE, node.getStatus().getHealthMessage()))
+                                        .compose(v -> markNodeWorkloadsFailed(node.getId()))
                                         .onFailure(error -> log.error("Error handling offline node {}", node.getId(), error));
                             }
                         }
@@ -291,8 +294,10 @@ public class DefaultVmNodeOrchestrationService implements VmNodeOrchestrationSer
                 .compose(page -> {
                     Future<Void> chain = Future.succeededFuture();
                     for (Workload workload : page.getContent()) {
+                        // a STOPPING workload is one whose stop never got an answer from the node
                         if (workload.getStatus() == WorkloadStatus.RUNNING
-                                || workload.getStatus() == WorkloadStatus.STARTING) {
+                                || workload.getStatus() == WorkloadStatus.STARTING
+                                || workload.getStatus() == WorkloadStatus.STOPPING) {
                             chain = chain.compose(v -> {
                                 log.warn("Marking workload {} as FAILED due to node {} going offline",
                                          workload.getId(), nodeId);
