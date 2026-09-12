@@ -123,7 +123,9 @@ public class OutgoingInvocations {
                                   throwable -> log.warn("Requester watch for invocation {} failed", correlationId, throwable));
     }
 
-    // the requester is gone: forget the invocation and tell the client to stop the stream
+    // Nothing listens on the requester's reply destination: forget the invocation and tell the client to stop
+    // the stream. The requester is answered too, so one whose registration this node had not seen yet gets
+    // the error instead of silence; a requester that is gone drops it with the rest.
     private void cancel(String correlationId) {
         OutgoingInvocation invocation = invocations.get(correlationId);
         if (invocation != null) {
@@ -131,6 +133,13 @@ public class OutgoingInvocations {
             Metadata metadata = Metadata.create(Map.of(EventConstants.CONTROL_HEADER, EventConstants.CONTROL_VALUE_CANCEL,
                                                        EventConstants.CORRELATION_ID_HEADER, correlationId));
             invocation.subscriptionHandler().handleEvent(Event.create(invocation.cri(), metadata, null));
+            RpcServiceUnavailableException cause = new RpcServiceUnavailableException(
+                    "No listener on the reply destination of the stream");
+            try {
+                services.eventBusService.send(services.exceptionConverter.convert(invocation.replyMetadata(), cause));
+            } catch (Exception e) {
+                log.error("Could not answer invocation {} after its requester stopped listening", correlationId, e);
+            }
         }
     }
 

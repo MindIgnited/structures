@@ -112,8 +112,7 @@ public class EndpointConnectionHandler {
                         new AuthenticationException("A Vert.x session is required unless session keep alive mode is NONE"));
             } else {
                 // The replyToId is generated server side so the client cannot pick a guessable
-                // or colliding value. It is reused for the life of the session so the client's
-                // reply destination stays stable across reconnects.
+                // or colliding value
                 if (connectedInfo.getReplyToId() == null) {
                     connectedInfo.setReplyToId(UUID.randomUUID().toString());
                 }
@@ -124,6 +123,8 @@ public class EndpointConnectionHandler {
 
                 signalActivity();
                 if (sessionKeepAliveMode == SessionKeepAliveMode.CONNECTION) {
+                    // the upgrade response never reaches the store, so the connection's first write is this one
+                    touchSession();
                     startSessionTouchTimer();
                 }
                 ret = Future.succeededFuture(Map.of(EventConstants.CONNECTED_INFO_HEADER,
@@ -152,11 +153,24 @@ public class EndpointConnectionHandler {
     public Future<Void> send(Event<byte[]> incomingEvent) {
         signalActivity();
 
-        // a reply to an invocation this client is serving is allowed for as long as the invocation is pending
-        boolean allowed = (incomingEvent.cri().scheme().equals(EventConstants.REPLY_DESTINATION_SCHEME)
-                           && outgoingInvocations.owesReply(incomingEvent))
-                          || stompAuthorizer.sendAllowed(incomingEvent.cri());
-        if (!allowed) {
+        if (incomingEvent.cri().scheme().equals(EventConstants.REPLY_DESTINATION_SCHEME)) {
+            // A reply is a one-way delivery to the requester's reply destination. It is never invoked and
+            // never itself replies, so no ack and no reply-to validation apply. A reply to an invocation this
+            // client is serving is allowed for as long as the invocation is pending; one for an invocation
+            // this connection no longer holds, such as a value crossing a cancel or a reply finished after a
+            // reconnect, is dropped rather than ending the connection.
+            if (outgoingInvocations.owesReply(incomingEvent)) {
+                outgoingInvocations.observeReply(incomingEvent);
+                services.eventBusService.send(incomingEvent);
+            } else if (stompAuthorizer.sendAllowed(incomingEvent.cri())) {
+                services.eventBusService.send(incomingEvent);
+            } else {
+                log.debug("Dropping reply to {} for an invocation this connection does not owe", incomingEvent.cri());
+            }
+            return Future.succeededFuture();
+        }
+
+        if (!stompAuthorizer.sendAllowed(incomingEvent.cri())) {
             return Future.failedFuture(new AuthorizationException("Not Authorized to send to " + incomingEvent.cri()));
         }
 
@@ -171,6 +185,13 @@ public class EndpointConnectionHandler {
 
                 String correlationId = incomingEvent.metadata().get(EventConstants.CORRELATION_ID_HEADER);
                 incomingInvocations.track(incomingEvent);
+
+                // A control event names a stream by correlation id and is published: the instance producing
+                // the stream is whichever one took the request, and the others ignore an id they do not hold
+                if (incomingEvent.metadata().contains(EventConstants.CONTROL_HEADER)) {
+                    services.eventBusService.publish(incomingEvent);
+                    return Future.succeededFuture();
+                }
 
                 return services.eventBusService
                         .sendWithAck(incomingEvent)
@@ -204,14 +225,6 @@ public class EndpointConnectionHandler {
         } else if (incomingEvent.cri().scheme().equals(EventConstants.STREAM_DESTINATION_SCHEME)) {
 
             return services.eventStreamService.send(incomingEvent);
-
-        } else if (incomingEvent.cri().scheme().equals(EventConstants.REPLY_DESTINATION_SCHEME)) {
-
-            // A reply is a one-way delivery to the requester's reply destination. It is never
-            // invoked and never itself replies, so no ack and no reply-to validation apply.
-            outgoingInvocations.observeReply(incomingEvent);
-            services.eventBusService.send(incomingEvent);
-            return Future.succeededFuture();
 
         } else {
             return Future.failedFuture(new IllegalArgumentException("CRI scheme not supported"));
@@ -257,7 +270,8 @@ public class EndpointConnectionHandler {
                         // event entered through send(), so it can only name the sender's own destination.
                         boolean pending = outgoingInvocations.deliver(event, subscriptionHandler);
                         String replyTo = event.metadata().get(EventConstants.REPLY_TO_HEADER);
-                        if (!pending && replyTo != null) {
+                        // a control event is never answered, so its reply-to earns no grant
+                        if (!pending && replyTo != null && !event.metadata().contains(EventConstants.CONTROL_HEADER)) {
                             // a wildcard could match destinations beyond the sender's own
                             if (!replyTo.contains("*")) {
                                 stompAuthorizer.addTemporarySendAllowed(replyTo);
@@ -270,7 +284,7 @@ public class EndpointConnectionHandler {
                     })
                     .exceptionHandler(subscriptionHandler::handleError);
 
-            subscriptions.put(subscriptionIdentifier, eventConsumer);
+            replaceSubscription(subscriptionIdentifier, eventConsumer);
 
             log.debug("New Service Subscription cri: {} id: {} for login: {}",
                       cri.raw(),
@@ -284,7 +298,7 @@ public class EndpointConnectionHandler {
             eventConsumer.handler(subscriptionHandler::handleEvent)
                          .exceptionHandler(subscriptionHandler::handleError);
 
-            subscriptions.put(subscriptionIdentifier, eventConsumer);
+            replaceSubscription(subscriptionIdentifier, eventConsumer);
 
             log.debug("New Event Subscription cri: {} id: {} for login: {}",
                       cri.raw(),
@@ -317,6 +331,14 @@ public class EndpointConnectionHandler {
             } else {
                 log.debug("No subscription exists for subscriptionIdentifier: {}", subscriptionIdentifier);
             }
+        }
+    }
+
+    // a subscription id the client reuses ends the consumer it named before
+    private void replaceSubscription(String subscriptionIdentifier, EventConsumer eventConsumer) {
+        EventConsumer previous = subscriptions.put(subscriptionIdentifier, eventConsumer);
+        if (previous != null) {
+            previous.unregister();
         }
     }
 
@@ -389,7 +411,8 @@ public class EndpointConnectionHandler {
             log.error("Session-touch timer already started");
             throw new IllegalStateException("Internal server error");
         }
-        long sessionUpdateInterval = services.apiGatewayProperties.getSessionTimeout() / 2;
+        // a quarter of the timeout, so a flush that fails is retried before the stored copy expires
+        long sessionUpdateInterval = services.apiGatewayProperties.getSessionTimeout() / 4;
         sessionTimer = services.vertx.setPeriodic(sessionUpdateInterval, event -> {
             if (session == null) {
                 log.error("Session is null while session-touch timer is active");
